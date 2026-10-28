@@ -147,11 +147,16 @@ export default {
       wsrv.searchParams.set("url", sourceImageUrl);
       wsrv.searchParams.set("q", quality.toString());
       wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
-      wsrv.searchParams.set("n", "-1"); // Dukungan gambar multi-halaman/animasi jika ada
-      // Penting untuk Komikku: jangan batasi tinggi (height) karena Webtoon/Manhwa sangat panjang,
-      // cukup batasi lebar (width) maksimum ke 1200px jika gambar terlalu lebar (`we` = without enlargement)
+      wsrv.searchParams.set("n", "-1");
       wsrv.searchParams.set("w", "1200");
       wsrv.searchParams.set("we", "1");
+      wsrv.searchParams.set("maxage", "7d"); // <-- Diubah menjadi 7 hari (7d) di CDN wsrv.nl
+
+      if (isJpeg) {
+        wsrv.searchParams.set("bg", "white");
+        wsrv.searchParams.set("il", "");
+      }
+
       if (isBw) {
         wsrv.searchParams.set("filt", "greyscale");
       }
@@ -190,9 +195,16 @@ export default {
         const wpUrl = new URL(`https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`);
         wpUrl.searchParams.set("quality", quality.toString());
         wpUrl.searchParams.set("strip", "all");
+        if (isBw) {
+          wpUrl.searchParams.set("filter", "grayscale");
+        }
+
+        const wpHeaders = getMangaSpoofHeaders(rawUrl);
+        // Jika di Komikku disetel ke JPEG, paksa Photon mengirim JPEG (bukan WebP)
+        wpHeaders.set("Accept", isJpeg ? "image/jpeg,image/*;q=0.8" : "image/webp,image/*;q=0.8");
 
         wsrvRes = await fetch(wpUrl.toString(), {
-          headers: getMangaSpoofHeaders(rawUrl),
+          headers: wpHeaders,
           signal: AbortSignal.timeout(6500),
           cf: { cacheEverything: true, cacheTtl: 604800 },
         }).catch(() => null);
@@ -237,7 +249,7 @@ export default {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers": "x-original-size, x-bytes-saved, content-length",
         "Cross-Origin-Resource-Policy": "cross-origin",
-        "Cache-Control": "public, max-age=604800, immutable",
+        "Cache-Control": "public, max-age=604800, immutable", // 604800 detik = 7 hari
       });
 
       if (compSize > 0) {
