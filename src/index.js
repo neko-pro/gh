@@ -1,119 +1,215 @@
 import { PhotonImage, grayscale, resize, SamplingFilter } from "@cf-wasm/photon";
 
+const DEFAULT_QUALITY = 40;
+const MIN_COMPRESS_LENGTH = 1024;
+const MIN_TRANSPARENT_COMPRESS_LENGTH = MIN_COMPRESS_LENGTH * 100; // 100KB
+
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const params = url.searchParams;
-
-    const imageUrl = params.get("url");
-    if (!imageUrl) {
-      return new Response("Bandwidth Hero WASM Proxy v2 is running!", {
-        status: 200,
-        headers: { "Content-Type": "text/plain" },
+    // 0. Tangani preflight CORS dari ekstensi browser
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+        },
       });
     }
 
-    // Parameter dari Bandwidth Hero
-    const isBw = params.get("bw") === "1" || params.get("bw") === "true";
-    const quality = Math.min(Math.max(parseInt(params.get("l") || "40", 10), 10), 95);
-    const maxWidth = parseInt(params.get("max_width") || "1280", 10);
+    // 1. AUTENTIKASI (Seperti src/authenticate.js di repo himshim)
+    // Aktif otomatis hanya jika Anda mengatur variabel LOGIN dan PASSWORD di Settings Cloudflare Worker
+    if (env && env.LOGIN && env.PASSWORD) {
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader || !authHeader.startsWith("Basic ")) {
+        return new Response("Access denied", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="Bandwidth-Hero Compression Service"',
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      }
+      const base64Credentials = authHeader.slice(6);
+      const credentials = atob(base64Credentials);
+      const [login, password] = credentials.split(":");
+      if (login !== env.LOGIN || password !== env.PASSWORD) {
+        return new Response("Access denied", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="Bandwidth-Hero Compression Service"',
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      }
+    }
+
+    // 2. PARSING PARAMETER & VALIDASI (Seperti src/params.js di repo himshim)
+    const reqUrl = new URL(request.url);
+    const params = reqUrl.searchParams;
+
+    let rawUrl = params.getAll("url").join("&");
+    if (!rawUrl) {
+      // Respon wajib untuk validasi ekstensi ayastreb/bandwidth-hero
+      return new Response("bandwidth-hero-proxy", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Expose-Headers": "x-original-size, x-bytes-saved, content-length",
+        },
+      });
+    }
+
+    // Bersihkan URL dari injeksi proxy ISP (persis seperti di params.js himshim)
+    rawUrl = rawUrl.replace(/http:\/\/1\.1\.\d\.\d\/bmi\/(https?:\/\/)?/i, "http://");
+
+    const webp = params.get("jpeg") !== "1";
+    const bw = params.get("bw") !== "0" && params.get("bw") !== null && params.get("bw") !== "false";
+    const quality = parseInt(params.get("l"), 10) || DEFAULT_QUALITY;
+
+    // Fungsi Redirect identik dengan src/redirect.js
+    const redirect = (locationUrl) => {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          "Location": encodeURI(locationUrl),
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "private, no-cache, no-store, must-revalidate",
+          "Expires": "-1",
+          "Pragma": "no-cache",
+        },
+      });
+    };
+
+    // Fungsi Pengecekan Kompresi identik dengan src/shouldCompress.js
+    const shouldCompress = (originType, originSize, isWebp) => {
+      if (!originType.startsWith("image")) return false;
+      if (originSize === 0) return false;
+      if (isWebp && originSize < MIN_COMPRESS_LENGTH) return false;
+      if (
+        !isWebp &&
+        (originType.endsWith("png") || originType.endsWith("gif")) &&
+        originSize < MIN_TRANSPARENT_COMPRESS_LENGTH
+      ) {
+        return false;
+      }
+      return true;
+    };
 
     try {
-      const targetUrl = new URL(imageUrl);
+      const targetUrl = new URL(rawUrl);
 
-      // 1. Jangan minta image/avif di Accept header karena WASM Photon belum mendukung dekode AVIF
+      // 3. FETCH GAMBAR ASLI (Seperti index.js di repo himshim + Spoofing Anti-Block)
       const fetchHeaders = new Headers({
         "User-Agent":
           request.headers.get("User-Agent") ||
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": request.headers.get("Accept-Language") || "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": `${targetUrl.protocol}//${targetUrl.hostname}/`,
         "Origin": `${targetUrl.protocol}//${targetUrl.hostname}`,
+        "Via": "1.1 bandwidth-hero",
       });
 
-      const imgResponse = await fetch(imageUrl, {
+      // Teruskan Cookie jika ada (seperti di index.js himshim)
+      const cookie = request.headers.get("cookie");
+      if (cookie) {
+        fetchHeaders.set("Cookie", cookie);
+      }
+
+      const originResponse = await fetch(rawUrl, {
         headers: fetchHeaders,
         redirect: "follow",
       });
 
-      if (!imgResponse.ok) {
-        return Response.redirect(imageUrl, 302);
+      if (!originResponse.ok) {
+        return redirect(rawUrl);
       }
 
-      const contentType = (imgResponse.headers.get("content-type") || "").toLowerCase();
-      const originalBuffer = new Uint8Array(await imgResponse.arrayBuffer());
-      const originalSize = originalBuffer.byteLength;
+      const originBuffer = new Uint8Array(await originResponse.arrayBuffer());
+      const originSize = originBuffer.byteLength;
+      const originType = (originResponse.headers.get("content-type") || "").toLowerCase();
 
-      // Lewati jika GIF animasi atau SVG, atau ukuran di atas 6MB (mencegah CPU limit)
+      // Cek apakah memenuhi syarat kompresi (atau lewati jika GIF animasi / SVG / > 6MB)
       if (
-        contentType.includes("gif") ||
-        contentType.includes("svg") ||
-        originalSize > 6291456
+        !shouldCompress(originType, originSize, webp) ||
+        originType.includes("gif") ||
+        originType.includes("svg") ||
+        originSize > 6291456
       ) {
-        return new Response(originalBuffer, {
-          status: 200,
-          headers: {
-            "Content-Type": contentType || "image/jpeg",
-            "Access-Control-Allow-Origin": "*",
-            "Cross-Origin-Resource-Policy": "cross-origin",
-          },
-        });
+        return redirect(rawUrl);
       }
 
-      // 2. Dekode gambar ke dalam memori WASM
-      let workingImage = PhotonImage.new_from_byteslice(originalBuffer);
+      // 4. PROSES KOMPRESI (Seperti src/compress.js di repo himshim)
+      let workingImage = PhotonImage.new_from_byteslice(originBuffer);
 
-      // 3. Perkecil resolusi jika gambar terlalu lebar (opsional, menghemat ukuran file secara signifikan)
+      // Batasi ukuran maksimum (seperti limit pixel pada Sharp di himshim)
       const width = workingImage.get_width();
       const height = workingImage.get_height();
+      const MAX_WIDTH = 1600;
 
-      if (width > maxWidth) {
-        const newHeight = Math.round((height * maxWidth) / width);
-        const resizedImage = resize(workingImage, maxWidth, newHeight, SamplingFilter.Lanczos3);
-        workingImage.free(); // Bebaskan gambar lama dari RAM
-        workingImage = resizedImage;
+      if (width > MAX_WIDTH) {
+        const newHeight = Math.round((height * MAX_WIDTH) / width);
+        const resized = resize(workingImage, MAX_WIDTH, newHeight, SamplingFilter.Lanczos3);
+        workingImage.free();
+        workingImage = resized;
       }
 
-      // 4. Terapkan filter Hitam Putih jika bw=1
-      if (isBw) {
+      if (bw) {
         grayscale(workingImage);
       }
 
-      // 5. Kompres menggunakan encoder Lossy JPEG sesuai parameter quality (l)
-      // Catatan: get_bytes_webp() di Photon menggunakan Lossless WebP yang membuat ukuran membengkak,
-      // sedangkan get_bytes_jpeg(quality) mendukung kompresi lossy yang jauh lebih kecil.
-      const outputBuffer = workingImage.get_bytes_jpeg(quality);
-
-      // Bebaskan memori WASM
+      const clampedQuality = Math.min(Math.max(quality, 10), 95);
+      const outputBuffer = workingImage.get_bytes_jpeg(clampedQuality);
       workingImage.free();
 
       const compressedSize = outputBuffer.byteLength;
-      const bytesSaved = originalSize > compressedSize ? originalSize - compressedSize : 0;
+      const bytesSaved = originSize - compressedSize;
 
-      // 6. Kembalikan gambar hasil kompresi + Header indikator Bandwidth Hero
+      // Di compress.js himshim: jika hasil kompresi lebih besar dari ukuran asli (bytesSaved <= 0), redirect ke gambar asli
+      // Namun jika bw=1 (hitam-putih), tetap kirim hasil agar warna hitam-putihnya tidak hilang
+      if (bytesSaved <= 0 && !bw) {
+        return redirect(rawUrl);
+      }
+
+      // 5. SALIN HEADER & KIRIM RESPON (Seperti src/copyHeaders.js & src/compress.js)
+      const responseHeaders = new Headers();
+      const excludedHeaders = [
+        "host",
+        "connection",
+        "cf-ray",
+        "cf-cache-status",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "transfer-encoding",
+      ];
+
+      for (const [key, value] of originResponse.headers.entries()) {
+        if (!excludedHeaders.includes(key.toLowerCase())) {
+          try {
+            responseHeaders.set(key, value);
+          } catch (_) {}
+        }
+      }
+
+      responseHeaders.set("content-type", "image/jpeg");
+      responseHeaders.set("content-length", compressedSize.toString());
+      responseHeaders.set("x-original-size", originSize.toString());
+      responseHeaders.set("x-bytes-saved", Math.max(bytesSaved, 0).toString());
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Expose-Headers", "x-original-size, x-bytes-saved, content-length");
+      responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
+      responseHeaders.set("Cache-Control", "public, max-age=604800, immutable");
+
       return new Response(outputBuffer, {
         status: 200,
-        headers: {
-          "Content-Type": "image/jpeg",
-          "Content-Length": compressedSize.toString(),
-          "Access-Control-Allow-Origin": "*",
-          "Cross-Origin-Resource-Policy": "cross-origin",
-          "Cache-Control": "public, max-age=604800, immutable",
-          "X-Original-Size": originalSize.toString(),
-          "X-Bytes-Saved": bytesSaved.toString(),
-          "X-Proxy-Status": "COMPRESSED-WASM",
-        },
+        headers: responseHeaders,
       });
-    } catch (error) {
-      // Jika gagal (misal format gambar korup/tidak didukung), tambahkan header X-Proxy-Error agar mudah dicek
-      return new Response(null, {
-        status: 302,
-        headers: {
-          "Location": imageUrl,
-          "X-Proxy-Error": error.message || "WASM_ERROR",
-        },
-      });
+    } catch (err) {
+      return redirect(rawUrl);
     }
   },
 };
