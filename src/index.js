@@ -3,7 +3,7 @@
 // Jika diisi, URL di Komikku menjadi: https://nama-worker.workers.dev/rahasia123
 // Jika dikosongkan (""), bisa diakses langsung di: https://nama-worker.workers.dev
 // ============================================================================
-const SECRET_PATH = "readx"; // Contoh: "/komikku-saya" (kosongkan "" jika tidak ingin pakai path rahasia)
+const SECRET_PATH = "/readx"; // Contoh: "/komikku-saya" (kosongkan "" jika tidak ingin pakai path rahasia)
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981"; // Kunci internal agar endpoint /raw tidak jadi Open Proxy
 
 export default {
