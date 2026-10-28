@@ -1,0 +1,14 @@
+{
+  "name": "bwhero-wasm-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cf-wasm/photon": "^0.1.24"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
