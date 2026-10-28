@@ -2,11 +2,14 @@ import { PhotonImage, grayscale, resize, SamplingFilter } from "@cf-wasm/photon"
 
 const DEFAULT_QUALITY = 40;
 const MIN_COMPRESS_LENGTH = 1024;
-const MIN_TRANSPARENT_COMPRESS_LENGTH = MIN_COMPRESS_LENGTH * 100; // 100KB
+const MIN_TRANSPARENT_COMPRESS_LENGTH = MIN_COMPRESS_LENGTH * 50; // 50KB
+
+// Batas aman proses WASM di Tier Gratis agar tidak pernah kena 503 (CPU > 10ms / RAM > 128MB)
+const MAX_WASM_SIZE = 1.2 * 1024 * 1024; // 1.2 MB
 
 export default {
   async fetch(request, env, ctx) {
-    // 0. Tangani preflight CORS dari ekstensi browser
+    // 0. Tangani preflight CORS
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -18,8 +21,54 @@ export default {
       });
     }
 
-    // 1. AUTENTIKASI (Seperti src/authenticate.js di repo himshim)
-    // Aktif otomatis hanya jika Anda mengatur variabel LOGIN dan PASSWORD di Settings Cloudflare Worker
+    const reqUrl = new URL(request.url);
+    const params = reqUrl.searchParams;
+
+    // Fungsi pembuat header penyamaran (Anti-Hotlink)
+    const getSpoofedHeaders = (targetUrlStr) => {
+      const target = new URL(targetUrlStr);
+      const h = new Headers({
+        "User-Agent":
+          request.headers.get("User-Agent") ||
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8",
+        "Accept-Language": request.headers.get("Accept-Language") || "id-ID,id;q=0.9,en-US;q=0.8",
+        "Referer": `${target.protocol}//${target.hostname}/`,
+        "Origin": `${target.protocol}//${target.hostname}`,
+        "Via": "1.1 bandwidth-hero",
+      });
+      const cookie = request.headers.get("cookie");
+      if (cookie) h.set("Cookie", cookie);
+      return h;
+    };
+
+    // =========================================================================
+    // ENDPOINT /raw: Mengalirkan gambar besar (>1.2MB) dengan Spoofed Header
+    // tanpa memakan RAM/CPU Worker (Streaming langsung)
+    // =========================================================================
+    if (reqUrl.pathname === "/raw") {
+      const targetImg = params.get("url");
+      if (!targetImg) return new Response("Missing URL", { status: 400 });
+      try {
+        const res = await fetch(targetImg, {
+          headers: getSpoofedHeaders(targetImg),
+          redirect: "follow",
+          cf: { cacheEverything: true, cacheTtl: 86400 },
+        });
+        return new Response(res.body, {
+          status: res.status,
+          headers: {
+            "Content-Type": res.headers.get("Content-Type") || "image/jpeg",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400",
+          },
+        });
+      } catch (_) {
+        return Response.redirect(targetImg, 302);
+      }
+    }
+
+    // 1. AUTENTIKASI (Opsional)
     if (env && env.LOGIN && env.PASSWORD) {
       const authHeader = request.headers.get("Authorization");
       if (!authHeader || !authHeader.startsWith("Basic ")) {
@@ -31,27 +80,15 @@ export default {
           },
         });
       }
-      const base64Credentials = authHeader.slice(6);
-      const credentials = atob(base64Credentials);
-      const [login, password] = credentials.split(":");
+      const [login, password] = atob(authHeader.slice(6)).split(":");
       if (login !== env.LOGIN || password !== env.PASSWORD) {
-        return new Response("Access denied", {
-          status: 401,
-          headers: {
-            "WWW-Authenticate": 'Basic realm="Bandwidth-Hero Compression Service"',
-            "Access-Control-Allow-Origin": "*",
-          },
-        });
+        return new Response("Access denied", { status: 401 });
       }
     }
 
-    // 2. PARSING PARAMETER & VALIDASI (Seperti src/params.js di repo himshim)
-    const reqUrl = new URL(request.url);
-    const params = reqUrl.searchParams;
-
+    // 2. PARSING PARAMETER & VALIDASI EKSTENSI
     let rawUrl = params.getAll("url").join("&");
     if (!rawUrl) {
-      // Respon wajib untuk validasi ekstensi ayastreb/bandwidth-hero
       return new Response("bandwidth-hero-proxy", {
         status: 200,
         headers: {
@@ -62,14 +99,20 @@ export default {
       });
     }
 
-    // Bersihkan URL dari injeksi proxy ISP (persis seperti di params.js himshim)
     rawUrl = rawUrl.replace(/http:\/\/1\.1\.\d\.\d\/bmi\/(https?:\/\/)?/i, "http://");
 
     const webp = params.get("jpeg") !== "1";
-    const bw = params.get("bw") !== "0" && params.get("bw") !== null && params.get("bw") !== "false";
-    const quality = parseInt(params.get("l"), 10) || DEFAULT_QUALITY;
+    const bw = params.get("bw") === "1" || params.get("bw") === "true";
+    const quality = Math.min(Math.max(parseInt(params.get("l"), 10) || DEFAULT_QUALITY, 10), 95);
 
-    // Fungsi Redirect identik dengan src/redirect.js
+    // 3. CEK CLOUDFLARE EDGE CACHE
+    const cache = caches.default;
+    const cacheKey = new Request(reqUrl.toString(), { method: "GET" });
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
     const redirect = (locationUrl) => {
       return new Response(null, {
         status: 302,
@@ -77,82 +120,115 @@ export default {
           "Location": encodeURI(locationUrl),
           "Access-Control-Allow-Origin": "*",
           "Cache-Control": "private, no-cache, no-store, must-revalidate",
-          "Expires": "-1",
-          "Pragma": "no-cache",
         },
       });
     };
 
-    // Fungsi Pengecekan Kompresi identik dengan src/shouldCompress.js
-    const shouldCompress = (originType, originSize, isWebp) => {
-      if (!originType.startsWith("image")) return false;
-      if (originSize === 0) return false;
-      if (isWebp && originSize < MIN_COMPRESS_LENGTH) return false;
-      if (
-        !isWebp &&
-        (originType.endsWith("png") || originType.endsWith("gif")) &&
-        originSize < MIN_TRANSPARENT_COMPRESS_LENGTH
-      ) {
-        return false;
+    // Fungsi Fallback Kompresi Eksternal untuk Gambar Raksasa (> 1.2 MB) agar Worker tidak kena 503
+    const offloadHeavyImage = async (targetImgUrl, originalSize) => {
+      try {
+        const proxiedRawUrl = `${reqUrl.origin}/raw?url=${encodeURIComponent(targetImgUrl)}`;
+        const wsrvUrl = new URL("https://wsrv.nl/");
+        wsrvUrl.searchParams.set("url", proxiedRawUrl);
+        wsrvUrl.searchParams.set("q", quality.toString());
+        wsrvUrl.searchParams.set("output", webp ? "webp" : "jpg");
+        wsrvUrl.searchParams.set("w", "1000");
+        wsrvUrl.searchParams.set("we", "1"); // Jangan perbesar jika gambar kecil
+        if (bw) wsrvUrl.searchParams.set("filt", "greyscale");
+
+        const extRes = await fetch(wsrvUrl.toString(), { signal: AbortSignal.timeout(6000) });
+        if (!extRes.ok) return redirect(targetImgUrl);
+
+        const buf = await extRes.arrayBuffer();
+        const compSize = buf.byteLength;
+        const saved = Math.max((originalSize || compSize * 3) - compSize, 0);
+
+        const res = new Response(buf, {
+          status: 200,
+          headers: {
+            "Content-Type": webp ? "image/webp" : "image/jpeg",
+            "Content-Length": compSize.toString(),
+            "x-original-size": (originalSize || compSize * 3).toString(),
+            "x-bytes-saved": saved.toString(),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "x-original-size, x-bytes-saved, content-length",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Cache-Control": "public, max-age=604800, immutable",
+          },
+        });
+        ctx.waitUntil(cache.put(cacheKey, res.clone()));
+        return res;
+      } catch (_) {
+        return redirect(targetImgUrl);
       }
-      return true;
     };
 
+    let workingImage = null;
+
     try {
-      const targetUrl = new URL(rawUrl);
-
-      // 3. FETCH GAMBAR ASLI (Seperti index.js di repo himshim + Spoofing Anti-Block)
-      const fetchHeaders = new Headers({
-        "User-Agent":
-          request.headers.get("User-Agent") ||
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8",
-        "Accept-Language": request.headers.get("Accept-Language") || "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": `${targetUrl.protocol}//${targetUrl.hostname}/`,
-        "Origin": `${targetUrl.protocol}//${targetUrl.hostname}`,
-        "Via": "1.1 bandwidth-hero",
-      });
-
-      // Teruskan Cookie jika ada (seperti di index.js himshim)
-      const cookie = request.headers.get("cookie");
-      if (cookie) {
-        fetchHeaders.set("Cookie", cookie);
-      }
-
       const originResponse = await fetch(rawUrl, {
-        headers: fetchHeaders,
+        headers: getSpoofedHeaders(rawUrl),
         redirect: "follow",
+        signal: AbortSignal.timeout(6500),
+        cf: { cacheEverything: true, cacheTtl: 86400 },
       });
 
       if (!originResponse.ok) {
         return redirect(rawUrl);
       }
 
-      const originBuffer = new Uint8Array(await originResponse.arrayBuffer());
-      const originSize = originBuffer.byteLength;
       const originType = (originResponse.headers.get("content-type") || "").toLowerCase();
+      if (!originType.startsWith("image") || originType.includes("gif") || originType.includes("svg")) {
+        return redirect(rawUrl);
+      }
 
-      // Cek apakah memenuhi syarat kompresi (atau lewati jika GIF animasi / SVG / > 6MB)
+      // 4. CEK UKURAN SEBELUM MASUK KE RAM WASM (KUNCI ANTI-503)
+      const declaredLength = parseInt(originResponse.headers.get("content-length") || "0", 10);
+      if (declaredLength > MAX_WASM_SIZE) {
+        // Batalkan stream unduhan di Worker, alihkan ke jalur hemat CPU
+        await originResponse.body?.cancel();
+        return await offloadHeavyImage(rawUrl, declaredLength);
+      }
+
+      let originBuffer = new Uint8Array(await originResponse.arrayBuffer());
+      const originSize = originBuffer.byteLength;
+
+      // Jika ternyata ukurannya terlalu kecil, lewati
       if (
-        !shouldCompress(originType, originSize, webp) ||
-        originType.includes("gif") ||
-        originType.includes("svg") ||
-        originSize > 6291456
+        originSize === 0 ||
+        (webp && originSize < MIN_COMPRESS_LENGTH) ||
+        (!webp && (originType.endsWith("png") || originType.endsWith("gif")) && originSize < MIN_TRANSPARENT_COMPRESS_LENGTH)
       ) {
         return redirect(rawUrl);
       }
 
-      // 4. PROSES KOMPRESI (Seperti src/compress.js di repo himshim)
-      let workingImage = PhotonImage.new_from_byteslice(originBuffer);
+      // Jika server tidak mengirim header Content-Length tapi ternyata file aslinya > 1.2 MB
+      if (originSize > MAX_WASM_SIZE) {
+        originBuffer = null; // Kosongkan RAM segera
+        return await offloadHeavyImage(rawUrl, originSize);
+      }
 
-      // Batasi ukuran maksimum (seperti limit pixel pada Sharp di himshim)
+      // 5. PROSES WASM SUPER RINGAN (< 5ms CPU)
+      workingImage = PhotonImage.new_from_byteslice(originBuffer);
+      originBuffer = null; // Bebaskan buffer asli dari RAM V8 secepat mungkin
+
       const width = workingImage.get_width();
       const height = workingImage.get_height();
-      const MAX_WIDTH = 1600;
 
-      if (width > MAX_WIDTH) {
-        const newHeight = Math.round((height * MAX_WIDTH) / width);
-        const resized = resize(workingImage, MAX_WIDTH, newHeight, SamplingFilter.Lanczos3);
+      // Jika resolusi gambar terlalu tinggi (> 4.5 Megapixel, misal 2500x2000px),
+      // batalkan proses WASM agar RAM 128MB tidak jebol
+      if (width * height > 4500000) {
+        workingImage.free();
+        workingImage = null;
+        return await offloadHeavyImage(rawUrl, originSize);
+      }
+
+      const maxWidth = quality <= 25 ? 800 : quality <= 50 ? 1024 : 1280;
+
+      if (width > maxWidth) {
+        const newHeight = Math.round((height * maxWidth) / width);
+        // SamplingFilter.Nearest adalah filter paling ringan CPU (mencegah Error 503 / 1102)
+        const resized = resize(workingImage, maxWidth, newHeight, SamplingFilter.Nearest);
         workingImage.free();
         workingImage = resized;
       }
@@ -161,55 +237,41 @@ export default {
         grayscale(workingImage);
       }
 
-      const clampedQuality = Math.min(Math.max(quality, 10), 95);
-      const outputBuffer = workingImage.get_bytes_jpeg(clampedQuality);
+      const outputBuffer = workingImage.get_bytes_jpeg(quality);
       workingImage.free();
+      workingImage = null;
 
       const compressedSize = outputBuffer.byteLength;
       const bytesSaved = originSize - compressedSize;
 
-      // Di compress.js himshim: jika hasil kompresi lebih besar dari ukuran asli (bytesSaved <= 0), redirect ke gambar asli
-      // Namun jika bw=1 (hitam-putih), tetap kirim hasil agar warna hitam-putihnya tidak hilang
       if (bytesSaved <= 0 && !bw) {
         return redirect(rawUrl);
       }
 
-      // 5. SALIN HEADER & KIRIM RESPON (Seperti src/copyHeaders.js & src/compress.js)
-      const responseHeaders = new Headers();
-      const excludedHeaders = [
-        "host",
-        "connection",
-        "cf-ray",
-        "cf-cache-status",
-        "content-encoding",
-        "content-length",
-        "content-type",
-        "transfer-encoding",
-      ];
-
-      for (const [key, value] of originResponse.headers.entries()) {
-        if (!excludedHeaders.includes(key.toLowerCase())) {
-          try {
-            responseHeaders.set(key, value);
-          } catch (_) {}
-        }
-      }
-
-      responseHeaders.set("content-type", "image/jpeg");
-      responseHeaders.set("content-length", compressedSize.toString());
-      responseHeaders.set("x-original-size", originSize.toString());
-      responseHeaders.set("x-bytes-saved", Math.max(bytesSaved, 0).toString());
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Access-Control-Expose-Headers", "x-original-size, x-bytes-saved, content-length");
-      responseHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
-      responseHeaders.set("Cache-Control", "public, max-age=604800, immutable");
-
-      return new Response(outputBuffer, {
+      const finalResponse = new Response(outputBuffer, {
         status: 200,
-        headers: responseHeaders,
+        headers: {
+          "Content-Type": "image/jpeg",
+          "Content-Length": compressedSize.toString(),
+          "x-original-size": originSize.toString(),
+          "x-bytes-saved": Math.max(bytesSaved, 0).toString(),
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Expose-Headers": "x-original-size, x-bytes-saved, content-length",
+          "Cross-Origin-Resource-Policy": "cross-origin",
+          "Cache-Control": "public, max-age=604800, immutable",
+        },
       });
+
+      ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+      return finalResponse;
     } catch (err) {
       return redirect(rawUrl);
+    } finally {
+      if (workingImage) {
+        try {
+          workingImage.free();
+        } catch (_) {}
+      }
     }
   },
 };
