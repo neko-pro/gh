@@ -1,7 +1,7 @@
 // ============================================================================
 // BANDWIDTH HERO PROXY - ULTRA DATA SAVER EDITION (KOMIKKU & WSRV.NL)
 // ============================================================================
-const SECRET_PATH = ""; // Kosongkan "" jika tidak ingin pakai path rahasia
+const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
 
 export default {
