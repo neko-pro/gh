@@ -1,11 +1,13 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - 100% WSRV.NL (FIXED & TESTED FOR ALL SITES)
+// BANDWIDTH HERO PROXY - FINAL OPTIMIZED 100% WSRV.NL (KOMIKKU & EXHENTAI)
+// Fitur: 0ms CPU Streaming, Adaptive Width, Cache 7 Hari, Anti-Loopback Relay
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
 
 export default {
   async fetch(request, env, ctx) {
+    // 0. Tangani preflight CORS
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -17,6 +19,7 @@ export default {
       });
     }
 
+    // Keamanan ToS: Hanya izinkan metode GET dan HEAD
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("Method Not Allowed", { status: 405 });
     }
@@ -24,7 +27,7 @@ export default {
     const reqUrl = new URL(request.url);
     const params = reqUrl.searchParams;
 
-    // Deteksi apakah URL berasal dari ExHentai / E-Hentai / Port Non-Standar
+    // 1. Deteksi apakah URL berasal dari ExHentai / E-Hentai / Port Non-Standar
     const isProtectedOrCustomPort = (urlStr) => {
       try {
         const u = new URL(urlStr);
@@ -42,6 +45,7 @@ export default {
       }
     };
 
+    // 2. Pembuat Header Penyamaran (Spoofed Referer & Cookie)
     const getMangaSpoofHeaders = (targetUrlStr, forwardedCookie = "") => {
       const target = new URL(targetUrlStr);
       const host = target.hostname.toLowerCase();
@@ -50,7 +54,7 @@ export default {
 
       if (host.includes("mangadex.network") || host.includes("mangadex.org")) {
         refererOrigin = "https://mangadex.org/";
-      } else if (host.includes("pximg.net")) {
+      } else if (host.includes("pximg.net") || host.includes("pixiv.net")) {
         refererOrigin = "https://www.pixiv.net/";
       } else if (host.includes("bato.to") || host.includes("mbimg.org")) {
         refererOrigin = "https://bato.to/";
@@ -90,8 +94,8 @@ export default {
     };
 
     // =========================================================================
-    // ENDPOINT INTERNAL /raw/image.jpg
-    // Mengambil gambar mentah (dengan Cookie & Referer) untuk disuapkan ke wsrv.nl
+    // ENDPOINT INTERNAL: /raw/image.jpg
+    // Mengambil gambar mentah yang terblokir untuk disuapkan ke wsrv.nl
     // =========================================================================
     if (reqUrl.pathname.startsWith("/raw")) {
       const targetImg = params.get("url");
@@ -118,7 +122,7 @@ export default {
         }).catch(() => null);
 
         // Jika gagal karena port non-standar Hentai@Home (misal :12345),
-        // otomatis coba ulang dengan menghapus port (memakai port 443 standar H@H)
+        // otomatis coba ulang dengan menghapus port (memakai port 443 standar)
         if (!rawRes || !rawRes.ok) {
           const u = new URL(targetImg);
           if (u.port && u.port !== "443" && u.port !== "80") {
@@ -136,6 +140,7 @@ export default {
           return new Response("Upstream Error", { status: rawRes ? rawRes.status : 502 });
         }
 
+        // Keamanan ToS: Hanya izinkan konten gambar
         const cType = (rawRes.headers.get("content-type") || "").toLowerCase();
         if (cType && !cType.startsWith("image/") && !cType.includes("octet-stream")) {
           await rawRes.body?.cancel();
@@ -155,10 +160,12 @@ export default {
       }
     }
 
+    // 3. Validasi Secret Path (jika diisi)
     if (SECRET_PATH && !reqUrl.pathname.startsWith(SECRET_PATH)) {
       return new Response("Not Found", { status: 404 });
     }
 
+    // 4. Parsing Parameter dari Aplikasi Komikku
     let rawUrl = params.getAll("url").join("&");
     if (!rawUrl) {
       return new Response("bandwidth-hero-proxy", {
@@ -180,9 +187,13 @@ export default {
     const isBw = params.get("bw") === "1" || params.get("bw") === "true";
     const rawQuality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
 
+    // Optimasi Penghematan Data:
+    // - Turunkan kualitas 5 poin saat Hitam-Putih aktif (tetap tajam namun jauh lebih kecil)
+    // - Sesuaikan lebar maksimum dengan level kualitas yang dipilih di Komikku
     const effectiveQuality = isBw ? Math.max(rawQuality - 5, 10) : rawQuality;
     const targetWidth = rawQuality <= 35 ? "720" : rawQuality <= 65 ? "900" : "1100";
 
+    // 5. Cek Cache Edge Cloudflare
     const cache = caches.default;
     const cacheKey = new Request(reqUrl.toString(), { method: "GET" });
     const cachedResponse = await cache.match(cacheKey);
@@ -190,21 +201,19 @@ export default {
       return cachedResponse;
     }
 
-    // =========================================================================
-    // PEMBUAT URL WSRV.NL (SUDAH BEBAS DARI PARAMETER 'af=1' PENYEBAB ERROR 400)
-    // =========================================================================
+    // 6. Pembuat URL Kompresi wsrv.nl (100% Kompatibel WebP & JPEG)
     const buildWsrvUrl = (sourceImageUrl) => {
       const wsrv = new URL("https://wsrv.nl/");
       wsrv.searchParams.set("url", sourceImageUrl);
       wsrv.searchParams.set("q", effectiveQuality.toString());
       wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
       wsrv.searchParams.set("w", targetWidth);
-      wsrv.searchParams.set("we", "1");
-      wsrv.searchParams.set("maxage", "7d");
+      wsrv.searchParams.set("we", "1"); // Jangan perbesar gambar kecil
+      wsrv.searchParams.set("maxage", "7d"); // Simpan di CDN wsrv.nl selama 7 hari
 
       if (isJpeg) {
-        wsrv.searchParams.set("bg", "white");
-        wsrv.searchParams.set("il", ""); // Kosongkan string untuk boolean flag di wsrv.nl
+        wsrv.searchParams.set("bg", "white"); // Mencegah PNG transparan jadi hitam pekat
+        wsrv.searchParams.set("il", ""); // Progressive JPEG & optimasi tabel Huffman
       }
 
       if (isBw) {
@@ -268,7 +277,7 @@ export default {
         }
       }
 
-      // Rute 3: Gunakan i0.wp.com sebagai pengambil sumber asli, lalu tetap suapkan ke wsrv.nl
+      // Rute 3: Gunakan i0.wp.com sebagai pengambil sumber asli, lalu suapkan ke wsrv.nl
       if (!wsrvRes || !wsrvRes.ok) {
         const parsed = new URL(cleanUrlForWsrv);
         const wpSource = `https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`;
@@ -279,10 +288,12 @@ export default {
         }).catch(() => null);
       }
 
+      // Rute 4: Final Fallback Redirect (Jika semua jembatan ditolak karena IP-Lock ketat)
       if (!wsrvRes || !wsrvRes.ok) {
         return Response.redirect(rawUrl, 302);
       }
 
+      // 7. Streaming Hasil Kompresi ke Komikku (0 MB RAM)
       const compSize = parseInt(wsrvRes.headers.get("content-length") || "0", 10);
       const estimatedOrigSize = compSize * 3;
       const bytesSaved = compSize * 2;
