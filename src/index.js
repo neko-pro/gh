@@ -1,5 +1,5 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - ULTRA DATA SAVER EDITION (KOMIKKU & WSRV.NL)
+// BANDWIDTH HERO PROXY - MAXIMAL WSRV.NL OPTIMIZATION FOR KOMIKKU
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
@@ -117,10 +117,14 @@ export default {
 
     const isJpeg = params.get("jpeg") === "1";
     const isBw = params.get("bw") === "1" || params.get("bw") === "true";
-    const quality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
+    const rawQuality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
 
-    // Adaptive Width berdasarkan level kualitas (menghemat kuota hingga 40% ekstra)
-    const targetWidth = quality <= 35 ? "800" : quality <= 65 ? "960" : "1200";
+    // OPTIMASI 1: Jika mode Hitam-Putih (bw=1) aktif, turunkan nilai q sebesar 5 poin
+    // karena gambar monokrom tetap tajam meski dikompresi lebih kuat.
+    const effectiveQuality = isBw ? Math.max(rawQuality - 5, 10) : rawQuality;
+
+    // OPTIMASI 2: Lebar gambar (Viewport Width) disesuaikan ketat dengan level penghematan
+    const targetWidth = rawQuality <= 35 ? "720" : rawQuality <= 65 ? "900" : "1100";
 
     const cache = caches.default;
     const cacheKey = new Request(reqUrl.toString(), { method: "GET" });
@@ -129,19 +133,20 @@ export default {
       return cachedResponse;
     }
 
+    // OPTIMASI 3: Maksimalkan parameter kompresi libvips pada wsrv.nl
     const buildWsrvUrl = (sourceImageUrl) => {
       const wsrv = new URL("https://wsrv.nl/");
       wsrv.searchParams.set("url", sourceImageUrl);
-      wsrv.searchParams.set("q", quality.toString());
+      wsrv.searchParams.set("q", effectiveQuality.toString());
       wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
-      wsrv.searchParams.set("n", "-1");
       wsrv.searchParams.set("w", targetWidth);
-      wsrv.searchParams.set("we", "1"); // Jangan perbesar gambar jika aslinya sudah kecil
-      wsrv.searchParams.set("maxage", "7d"); // Cache 7 hari
+      wsrv.searchParams.set("we", "1"); // Jangan perbesar gambar kecil
+      wsrv.searchParams.set("af", "1"); // Adaptive Filter: mengecilkan ukuran file komik ekstra 5-15%
+      wsrv.searchParams.set("maxage", "7d"); // Cache 7 hari di CDN wsrv.nl
 
       if (isJpeg) {
         wsrv.searchParams.set("bg", "white");
-        wsrv.searchParams.set("il", ""); // Progressive JPEG
+        wsrv.searchParams.set("il", "1"); // Progressive JPEG + optimasi tabel Huffman
       }
 
       if (isBw) {
@@ -168,12 +173,12 @@ export default {
         }).catch(() => null);
       }
 
-      // Lapis 3: Fallback WordPress Photon (i0.wp.com) dengan Adaptive Width
+      // Lapis 3: Fallback WordPress Photon (i0.wp.com)
       if (!wsrvRes || !wsrvRes.ok) {
         const parsed = new URL(rawUrl);
         const wpUrl = new URL(`https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`);
-        wpUrl.searchParams.set("quality", quality.toString());
-        wpUrl.searchParams.set("strip", "all"); // Buang semua metadata EXIF
+        wpUrl.searchParams.set("quality", effectiveQuality.toString());
+        wpUrl.searchParams.set("strip", "all");
         wpUrl.searchParams.set("w", targetWidth);
         if (isBw) {
           wpUrl.searchParams.set("filter", "grayscale");
