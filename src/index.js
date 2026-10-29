@@ -1,5 +1,5 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - MAXIMAL WSRV.NL OPTIMIZATION FOR KOMIKKU
+// BANDWIDTH HERO PROXY - MAXIMAL WSRV.NL + E-HENTAI (H@H) SUPPORT
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
@@ -24,16 +24,46 @@ export default {
     const reqUrl = new URL(request.url);
     const params = reqUrl.searchParams;
 
+    // Deteksi apakah URL berasal dari jaringan E-Hentai / ExHentai / Hentai@Home
+    const isEHentaiUrl = (urlStr) => {
+      try {
+        const u = new URL(urlStr);
+        const h = u.hostname.toLowerCase();
+        return (
+          h.includes("hath.network") ||
+          h.includes("e-hentai.org") ||
+          h.includes("exhentai.org") ||
+          h.includes("ehgt.org") ||
+          (u.port !== "" && u.port !== "80" && u.port !== "443") // Server dengan port non-standar
+        );
+      } catch (_) {
+        return false;
+      }
+    };
+
     const getMangaSpoofHeaders = (targetUrlStr) => {
       const target = new URL(targetUrlStr);
+      const host = target.hostname.toLowerCase();
       let refererOrigin = `${target.protocol}//${target.hostname}/`;
+      let includeOrigin = true;
 
-      if (target.hostname.includes("mangadex.network") || target.hostname.includes("mangadex.org")) {
+      if (host.includes("mangadex.network") || host.includes("mangadex.org")) {
         refererOrigin = "https://mangadex.org/";
-      } else if (target.hostname.includes("pximg.net")) {
+      } else if (host.includes("pximg.net")) {
         refererOrigin = "https://www.pixiv.net/";
-      } else if (target.hostname.includes("bato.to") || target.hostname.includes("mbimg.org")) {
+      } else if (host.includes("bato.to") || host.includes("mbimg.org")) {
         refererOrigin = "https://bato.to/";
+      } else if (
+        host.includes("hath.network") ||
+        host.includes("ehgt.org") ||
+        host.includes("e-hentai.org")
+      ) {
+        // Khusus E-Hentai / H@H: Gunakan Referer utama dan jangan kirim header Origin
+        refererOrigin = "https://e-hentai.org/";
+        includeOrigin = false;
+      } else if (host.includes("exhentai.org")) {
+        refererOrigin = "https://exhentai.org/";
+        includeOrigin = false;
       }
 
       const headers = new Headers({
@@ -41,20 +71,27 @@ export default {
           request.headers.get("User-Agent") ||
           "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9,id-ID;q=0.8,id;q=0.7",
         "Referer": refererOrigin,
-        "Origin": refererOrigin.slice(0, -1),
         "Sec-Fetch-Dest": "image",
         "Sec-Fetch-Mode": "no-cors",
         "Sec-Fetch-Site": "cross-site",
       });
+
+      if (includeOrigin) {
+        headers.set("Origin", refererOrigin.slice(0, -1));
+      }
 
       const cookie = request.headers.get("cookie");
       if (cookie) headers.set("Cookie", cookie);
       return headers;
     };
 
-    // Endpoint Internal /raw (Anti-Block Bypass)
+    // =========================================================================
+    // Endpoint Internal /raw (Jembatan Port Standar 443 & Spoofed Header)
+    // Mengubah URL ber-port aneh (misal :12345 milik H@H) menjadi port 443 standar
+    // sehingga wsrv.nl mau memprosesnya!
+    // =========================================================================
     if (reqUrl.pathname === "/raw") {
       const targetImg = params.get("url");
       const sign = params.get("sign");
@@ -119,11 +156,7 @@ export default {
     const isBw = params.get("bw") === "1" || params.get("bw") === "true";
     const rawQuality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
 
-    // OPTIMASI 1: Jika mode Hitam-Putih (bw=1) aktif, turunkan nilai q sebesar 5 poin
-    // karena gambar monokrom tetap tajam meski dikompresi lebih kuat.
     const effectiveQuality = isBw ? Math.max(rawQuality - 5, 10) : rawQuality;
-
-    // OPTIMASI 2: Lebar gambar (Viewport Width) disesuaikan ketat dengan level penghematan
     const targetWidth = rawQuality <= 35 ? "720" : rawQuality <= 65 ? "900" : "1100";
 
     const cache = caches.default;
@@ -133,20 +166,19 @@ export default {
       return cachedResponse;
     }
 
-    // OPTIMASI 3: Maksimalkan parameter kompresi libvips pada wsrv.nl
     const buildWsrvUrl = (sourceImageUrl) => {
       const wsrv = new URL("https://wsrv.nl/");
       wsrv.searchParams.set("url", sourceImageUrl);
       wsrv.searchParams.set("q", effectiveQuality.toString());
       wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
       wsrv.searchParams.set("w", targetWidth);
-      wsrv.searchParams.set("we", "1"); // Jangan perbesar gambar kecil
-      wsrv.searchParams.set("af", "1"); // Adaptive Filter: mengecilkan ukuran file komik ekstra 5-15%
-      wsrv.searchParams.set("maxage", "7d"); // Cache 7 hari di CDN wsrv.nl
+      wsrv.searchParams.set("we", "1");
+      wsrv.searchParams.set("af", "1");
+      wsrv.searchParams.set("maxage", "7d");
 
       if (isJpeg) {
         wsrv.searchParams.set("bg", "white");
-        wsrv.searchParams.set("il", "1"); // Progressive JPEG + optimasi tabel Huffman
+        wsrv.searchParams.set("il", "1");
       }
 
       if (isBw) {
@@ -156,14 +188,22 @@ export default {
     };
 
     try {
-      // Lapis 1: wsrv.nl langsung
-      let wsrvRes = await fetch(buildWsrvUrl(rawUrl), {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        signal: AbortSignal.timeout(6500),
-        cf: { cacheEverything: true, cacheTtl: 604800 },
-      }).catch(() => null);
+      const isSpecialPortOrEH = isEHentaiUrl(rawUrl);
+      let wsrvRes = null;
 
-      // Lapis 2: wsrv.nl via /raw bypass (Jika server komik memblokir IP wsrv.nl / Hotlink)
+      // Lapis 1: wsrv.nl langsung (LEWATI Lapis 1 jika URL berasal dari E-Hentai / Port Kustom,
+      // karena wsrv.nl memblokir port selain 80/443 secara langsung)
+      if (!isSpecialPortOrEH) {
+        wsrvRes = await fetch(buildWsrvUrl(rawUrl), {
+          headers: { "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(6500),
+          cf: { cacheEverything: true, cacheTtl: 604800 },
+        }).catch(() => null);
+      }
+
+      // Lapis 2: wsrv.nl via /raw bypass
+      // Di sini URL E-Hentai yang tadinya memakai port kustom (:12345) dibungkus oleh
+      // endpoint /raw Worker kita (port 443 standar), sehingga wsrv.nl bisa mengompresinya!
       if (!wsrvRes || !wsrvRes.ok) {
         const proxiedRawUrl = `${reqUrl.origin}/raw?sign=${INTERNAL_RAW_SIGN}&url=${encodeURIComponent(rawUrl)}`;
         wsrvRes = await fetch(buildWsrvUrl(proxiedRawUrl), {
@@ -173,8 +213,8 @@ export default {
         }).catch(() => null);
       }
 
-      // Lapis 3: Fallback WordPress Photon (i0.wp.com)
-      if (!wsrvRes || !wsrvRes.ok) {
+      // Lapis 3: Fallback WordPress Photon (Hanya untuk domain port standar 80/443)
+      if ((!wsrvRes || !wsrvRes.ok) && !isSpecialPortOrEH) {
         const parsed = new URL(rawUrl);
         const wpUrl = new URL(`https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`);
         wpUrl.searchParams.set("quality", effectiveQuality.toString());
@@ -194,23 +234,32 @@ export default {
         }).catch(() => null);
       }
 
-      // Lapis 4: Final Fallback Stream Langsung
+      // Lapis 4: Final Fallback Stream / Redirect
+      // Jika node H@H E-Hentai mengunci token URL строго ke IP HP Anda (IP-locked),
+      // maka hanya HP Anda yang diizinkan mengunduh gambar tersebut (server proxy mana pun akan ditolak 403).
+      // Maka Worker akan melakukan Redirect 302 agar aplikasi Komikku di HP Anda mengunduhnya langsung.
       if (!wsrvRes || !wsrvRes.ok) {
         const directRes = await fetch(rawUrl, {
           headers: getMangaSpoofHeaders(rawUrl),
           redirect: "follow",
-          signal: AbortSignal.timeout(7000),
+          signal: AbortSignal.timeout(6500),
           cf: { cacheEverything: true, cacheTtl: 604800 },
-        });
+        }).catch(() => null);
 
-        if (!directRes.ok) {
+        if (!directRes || !directRes.ok) {
+          return Response.redirect(rawUrl, 302);
+        }
+
+        const cType = (directRes.headers.get("Content-Type") || "").toLowerCase();
+        if (!cType.startsWith("image/")) {
+          await directRes.body?.cancel();
           return Response.redirect(rawUrl, 302);
         }
 
         return new Response(directRes.body, {
           status: 200,
           headers: {
-            "Content-Type": directRes.headers.get("Content-Type") || "image/jpeg",
+            "Content-Type": cType,
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "public, max-age=604800, immutable",
           },
