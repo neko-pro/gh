@@ -1,5 +1,5 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - OPTIMIZED FOR KOMIKKU & WSRV.NL RELAY
+// BANDWIDTH HERO PROXY - ULTRA DATA SAVER EDITION (KOMIKKU & WSRV.NL)
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
@@ -68,7 +68,7 @@ export default {
           headers: getMangaSpoofHeaders(targetImg),
           redirect: "follow",
           signal: AbortSignal.timeout(7000),
-          cf: { cacheEverything: true, cacheTtl: 86400 },
+          cf: { cacheEverything: true, cacheTtl: 604800 },
         });
 
         if (!rawRes.ok) {
@@ -119,6 +119,9 @@ export default {
     const isBw = params.get("bw") === "1" || params.get("bw") === "true";
     const quality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
 
+    // OPTIMASI 1: Adaptive Width berdasarkan level kualitas (menghemat kuota hingga 40% ekstra)
+    const targetWidth = quality <= 35 ? "800" : quality <= 65 ? "960" : "1200";
+
     const cache = caches.default;
     const cacheKey = new Request(reqUrl.toString(), { method: "GET" });
     const cachedResponse = await cache.match(cacheKey);
@@ -126,19 +129,21 @@ export default {
       return cachedResponse;
     }
 
-    const buildWsrvUrl = (sourceImageUrl) => {
+    // Fungsi pembuat URL wsrv.nl dengan parameter forceFormat (untuk auto-fallback WebP -> JPG)
+    const buildWsrvUrl = (sourceImageUrl, forceJpeg = false) => {
+      const useJpeg = isJpeg || forceJpeg;
       const wsrv = new URL("https://wsrv.nl/");
       wsrv.searchParams.set("url", sourceImageUrl);
       wsrv.searchParams.set("q", quality.toString());
-      wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
+      wsrv.searchParams.set("output", useJpeg ? "jpg" : "webp");
       wsrv.searchParams.set("n", "-1");
-      wsrv.searchParams.set("w", "1200");
-      wsrv.searchParams.set("we", "1");
-      wsrv.searchParams.set("maxage", "7d"); // Cache 7 hari di CDN wsrv.nl
+      wsrv.searchParams.set("w", targetWidth);
+      wsrv.searchParams.set("we", "1"); // Jangan perbesar gambar jika aslinya sudah kecil
+      wsrv.searchParams.set("maxage", "7d"); // Cache 7 hari
 
-      if (isJpeg) {
+      if (useJpeg) {
         wsrv.searchParams.set("bg", "white");
-        wsrv.searchParams.set("il", "");
+        wsrv.searchParams.set("il", ""); // Progressive JPEG
       }
 
       if (isBw) {
@@ -148,29 +153,49 @@ export default {
     };
 
     try {
-      // Lapis 1: wsrv.nl langsung
-      let wsrvRes = await fetch(buildWsrvUrl(rawUrl), {
+      // Lapis 1: wsrv.nl langsung (WebP / sesuai setting)
+      let wsrvRes = await fetch(buildWsrvUrl(rawUrl, false), {
         headers: { "User-Agent": "Mozilla/5.0" },
         signal: AbortSignal.timeout(6500),
         cf: { cacheEverything: true, cacheTtl: 604800 },
       }).catch(() => null);
 
-      // Lapis 2: wsrv.nl via /raw bypass
-      if (!wsrvRes || !wsrvRes.ok) {
-        const proxiedRawUrl = `${reqUrl.origin}/raw?sign=${INTERNAL_RAW_SIGN}&url=${encodeURIComponent(rawUrl)}`;
-        wsrvRes = await fetch(buildWsrvUrl(proxiedRawUrl), {
+      // OPTIMASI 2: Jika gagal karena gambar Manhwa/Webtoon terlalu panjang (>16383px) untuk WebP,
+      // coba paksa format JPEG langsung di wsrv.nl sebelum memakai jalur /raw
+      if ((!wsrvRes || !wsrvRes.ok) && !isJpeg) {
+        wsrvRes = await fetch(buildWsrvUrl(rawUrl, true), {
           headers: { "User-Agent": "Mozilla/5.0" },
-          signal: AbortSignal.timeout(7500),
+          signal: AbortSignal.timeout(6500),
           cf: { cacheEverything: true, cacheTtl: 604800 },
         }).catch(() => null);
       }
 
-      // Lapis 3: Fallback WordPress Photon (i0.wp.com)
+      // Lapis 2: wsrv.nl via /raw bypass (Jika server komik memblokir IP wsrv.nl / Hotlink)
+      if (!wsrvRes || !wsrvRes.ok) {
+        const proxiedRawUrl = `${reqUrl.origin}/raw?sign=${INTERNAL_RAW_SIGN}&url=${encodeURIComponent(rawUrl)}`;
+        wsrvRes = await fetch(buildWsrvUrl(proxiedRawUrl, false), {
+          headers: { "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(7500),
+          cf: { cacheEverything: true, cacheTtl: 604800 },
+        }).catch(() => null);
+
+        // Jika masih gagal karena batas tinggi WebP pada jalur /raw, paksa JPEG
+        if ((!wsrvRes || !wsrvRes.ok) && !isJpeg) {
+          wsrvRes = await fetch(buildWsrvUrl(proxiedRawUrl, true), {
+            headers: { "User-Agent": "Mozilla/5.0" },
+            signal: AbortSignal.timeout(7500),
+            cf: { cacheEverything: true, cacheTtl: 604800 },
+          }).catch(() => null);
+        }
+      }
+
+      // Lapis 3: Fallback WordPress Photon (i0.wp.com) dengan Adaptive Width
       if (!wsrvRes || !wsrvRes.ok) {
         const parsed = new URL(rawUrl);
         const wpUrl = new URL(`https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`);
         wpUrl.searchParams.set("quality", quality.toString());
-        wpUrl.searchParams.set("strip", "all");
+        wpUrl.searchParams.set("strip", "all"); // Buang semua metadata EXIF
+        wpUrl.searchParams.set("w", targetWidth);
         if (isBw) {
           wpUrl.searchParams.set("filter", "grayscale");
         }
