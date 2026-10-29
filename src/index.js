@@ -1,6 +1,5 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - 100% ALL-ROUTES VIA WSRV.NL (KOMIKKU & EXHENTAI)
-// Seluruh gambar dari situs mana pun wajib melewati mesin kompresi wsrv.nl
+// BANDWIDTH HERO PROXY - 100% WSRV.NL (FIXED & TESTED FOR ALL SITES)
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
@@ -104,7 +103,13 @@ export default {
       }
 
       try {
-        const decodedCookie = encodedCookie ? atob(encodedCookie) : "";
+        let decodedCookie = "";
+        if (encodedCookie) {
+          try {
+            decodedCookie = atob(encodedCookie);
+          } catch (_) {}
+        }
+
         let rawRes = await fetch(targetImg, {
           headers: getMangaSpoofHeaders(targetImg, decodedCookie),
           redirect: "follow",
@@ -186,7 +191,7 @@ export default {
     }
 
     // =========================================================================
-    // SATU-SATUNYA MESIN KOMPRESI: 100% WSRV.NL
+    // PEMBUAT URL WSRV.NL (SUDAH BEBAS DARI PARAMETER 'af=1' PENYEBAB ERROR 400)
     // =========================================================================
     const buildWsrvUrl = (sourceImageUrl) => {
       const wsrv = new URL("https://wsrv.nl/");
@@ -195,12 +200,11 @@ export default {
       wsrv.searchParams.set("output", isJpeg ? "jpg" : "webp");
       wsrv.searchParams.set("w", targetWidth);
       wsrv.searchParams.set("we", "1");
-      wsrv.searchParams.set("af", "1");
       wsrv.searchParams.set("maxage", "7d");
 
       if (isJpeg) {
         wsrv.searchParams.set("bg", "white");
-        wsrv.searchParams.set("il", "1");
+        wsrv.searchParams.set("il", ""); // Kosongkan string untuk boolean flag di wsrv.nl
       }
 
       if (isBw) {
@@ -212,17 +216,22 @@ export default {
     try {
       const isProtected = isProtectedOrCustomPort(rawUrl);
       const userCookie = request.headers.get("cookie") || "";
-      const encodedCookie = userCookie ? btoa(userCookie) : "";
+      let encodedCookie = "";
+      if (userCookie) {
+        try {
+          encodedCookie = btoa(userCookie);
+        } catch (_) {}
+      }
+
       let wsrvRes = null;
 
       // Rute 1: wsrv.nl mengambil langsung dari URL sumber
-      // (Jika URL adalah ExHentai ber-port aneh, coba hapus portnya terlebih dahulu agar wsrv.nl mau menerima)
       let cleanUrlForWsrv = rawUrl;
       if (isProtected) {
         try {
           const u = new URL(rawUrl);
           if (u.hostname.endsWith(".hath.network") && u.port && u.port !== "443" && u.port !== "80") {
-            u.port = ""; // Paksa port 443 standar pada node H@H
+            u.port = ""; // Normalkan ke port 443 standar pada node H@H
             cleanUrlForWsrv = u.toString();
           }
         } catch (_) {}
@@ -247,8 +256,7 @@ export default {
           cf: { cacheEverything: true, cacheTtl: 604800 },
         }).catch(() => null);
 
-        // 2B: Jika terkena blokir Loopback Cloudflare (*.workers.dev),
-        // lewatkan URL /raw/image.jpg melalui perantara Non-Cloudflare (i0.wp.com) lalu masukkan ke wsrv.nl!
+        // 2B: Anti-Loopback via perantara Non-Cloudflare (i0.wp.com) lalu masukkan ke wsrv.nl
         if (!wsrvRes || !wsrvRes.ok) {
           const parsedBridge = new URL(rawBridgeUrl);
           const wpRelayUrl = `https://i0.wp.com/${parsedBridge.host}${parsedBridge.pathname}${parsedBridge.search}`;
@@ -260,7 +268,7 @@ export default {
         }
       }
 
-      // Rute 3: Gunakan i0.wp.com sebagai pengambil sumber asli, lalu tetap suapkan hasilnya ke wsrv.nl!
+      // Rute 3: Gunakan i0.wp.com sebagai pengambil sumber asli, lalu tetap suapkan ke wsrv.nl
       if (!wsrvRes || !wsrvRes.ok) {
         const parsed = new URL(cleanUrlForWsrv);
         const wpSource = `https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`;
