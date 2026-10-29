@@ -1,6 +1,6 @@
 // ============================================================================
-// BANDWIDTH HERO PROXY - 100% PURE WSRV.NL (EXHENTAI & KOMIKKU EDITION)
-// Tanpa WASM - 0ms CPU - Anti 503 - Mendukung Hitam Putih di ExHentai
+// BANDWIDTH HERO PROXY - 100% ALL-ROUTES VIA WSRV.NL (KOMIKKU & EXHENTAI)
+// Seluruh gambar dari situs mana pun wajib melewati mesin kompresi wsrv.nl
 // ============================================================================
 const SECRET_PATH = "/readx"; // Kosongkan "" jika tidak ingin pakai path rahasia
 const INTERNAL_RAW_SIGN = "bwh-raw-bridge-9981";
@@ -26,7 +26,7 @@ export default {
     const params = reqUrl.searchParams;
 
     // Deteksi apakah URL berasal dari ExHentai / E-Hentai / Port Non-Standar
-    const isEHentaiOrCustomPort = (urlStr) => {
+    const isProtectedOrCustomPort = (urlStr) => {
       try {
         const u = new URL(urlStr);
         const h = u.hostname.toLowerCase();
@@ -35,6 +35,7 @@ export default {
           h.includes("e-hentai.org") ||
           h.includes("exhentai.org") ||
           h.includes("ehgt.org") ||
+          h.includes("pximg.net") ||
           (u.port !== "" && u.port !== "80" && u.port !== "443")
         );
       } catch (_) {
@@ -82,7 +83,6 @@ export default {
         headers.set("Origin", refererOrigin.slice(0, -1));
       }
 
-      // Gunakan Cookie dari parameter jembatan (jika ada) atau dari header langsung
       const activeCookie = forwardedCookie || request.headers.get("cookie");
       if (activeCookie) {
         headers.set("Cookie", activeCookie);
@@ -91,10 +91,10 @@ export default {
     };
 
     // =========================================================================
-    // ENDPOINT INTERNAL /raw: Mengambil gambar ExHentai/Manga yang terproteksi
-    // beserta Cookie loginnya agar bisa dibaca oleh wsrv.nl
+    // ENDPOINT INTERNAL /raw/image.jpg
+    // Mengambil gambar mentah (dengan Cookie & Referer) untuk disuapkan ke wsrv.nl
     // =========================================================================
-    if (reqUrl.pathname === "/raw") {
+    if (reqUrl.pathname.startsWith("/raw")) {
       const targetImg = params.get("url");
       const sign = params.get("sign");
       const encodedCookie = params.get("ck") || "";
@@ -105,15 +105,30 @@ export default {
 
       try {
         const decodedCookie = encodedCookie ? atob(encodedCookie) : "";
-        const rawRes = await fetch(targetImg, {
+        let rawRes = await fetch(targetImg, {
           headers: getMangaSpoofHeaders(targetImg, decodedCookie),
           redirect: "follow",
           signal: AbortSignal.timeout(7000),
           cf: { cacheEverything: true, cacheTtl: 604800 },
-        });
+        }).catch(() => null);
 
-        if (!rawRes.ok) {
-          return new Response("Upstream Error", { status: rawRes.status });
+        // Jika gagal karena port non-standar Hentai@Home (misal :12345),
+        // otomatis coba ulang dengan menghapus port (memakai port 443 standar H@H)
+        if (!rawRes || !rawRes.ok) {
+          const u = new URL(targetImg);
+          if (u.port && u.port !== "443" && u.port !== "80") {
+            u.port = "";
+            rawRes = await fetch(u.toString(), {
+              headers: getMangaSpoofHeaders(u.toString(), decodedCookie),
+              redirect: "follow",
+              signal: AbortSignal.timeout(6500),
+              cf: { cacheEverything: true, cacheTtl: 604800 },
+            }).catch(() => null);
+          }
+        }
+
+        if (!rawRes || !rawRes.ok) {
+          return new Response("Upstream Error", { status: rawRes ? rawRes.status : 502 });
         }
 
         const cType = (rawRes.headers.get("content-type") || "").toLowerCase();
@@ -156,20 +171,6 @@ export default {
       return new Response("Invalid URL protocol", { status: 400 });
     }
 
-    // Jika URL Hentai@Home menggunakan port non-standar yang ditolak oleh Cloudflare/wsrv.nl,
-    // coba normalkan ke port HTTPS standar (443) khusus untuk domain *.hath.network
-    try {
-      const parsedCheck = new URL(rawUrl);
-      if (
-        parsedCheck.hostname.endsWith(".hath.network") &&
-        parsedCheck.port &&
-        parsedCheck.port !== "443" &&
-        parsedCheck.port !== "80"
-      ) {
-        // Simpan URL asli untuk jaga-jaga, tapi kita juga siapkan rute jembatan
-      }
-    } catch (_) {}
-
     const isJpeg = params.get("jpeg") === "1";
     const isBw = params.get("bw") === "1" || params.get("bw") === "true";
     const rawQuality = Math.min(Math.max(parseInt(params.get("l"), 10) || 40, 10), 95);
@@ -184,7 +185,9 @@ export default {
       return cachedResponse;
     }
 
-    // Pembuat URL wsrv.nl
+    // =========================================================================
+    // SATU-SATUNYA MESIN KOMPRESI: 100% WSRV.NL
+    // =========================================================================
     const buildWsrvUrl = (sourceImageUrl) => {
       const wsrv = new URL("https://wsrv.nl/");
       wsrv.searchParams.set("url", sourceImageUrl);
@@ -207,40 +210,45 @@ export default {
     };
 
     try {
-      const isSpecialEH = isEHentaiOrCustomPort(rawUrl);
+      const isProtected = isProtectedOrCustomPort(rawUrl);
       const userCookie = request.headers.get("cookie") || "";
       const encodedCookie = userCookie ? btoa(userCookie) : "";
       let wsrvRes = null;
 
-      // =======================================================================
-      // LAPIS 1: wsrv.nl langsung ke URL gambar
-      // (Bekerja untuk 95% situs manga & server utama ehgt.org E-Hentai)
-      // =======================================================================
-      wsrvRes = await fetch(buildWsrvUrl(rawUrl), {
+      // Rute 1: wsrv.nl mengambil langsung dari URL sumber
+      // (Jika URL adalah ExHentai ber-port aneh, coba hapus portnya terlebih dahulu agar wsrv.nl mau menerima)
+      let cleanUrlForWsrv = rawUrl;
+      if (isProtected) {
+        try {
+          const u = new URL(rawUrl);
+          if (u.hostname.endsWith(".hath.network") && u.port && u.port !== "443" && u.port !== "80") {
+            u.port = ""; // Paksa port 443 standar pada node H@H
+            cleanUrlForWsrv = u.toString();
+          }
+        } catch (_) {}
+      }
+
+      wsrvRes = await fetch(buildWsrvUrl(cleanUrlForWsrv), {
         headers: { "User-Agent": "Mozilla/5.0" },
         signal: AbortSignal.timeout(6000),
         cf: { cacheEverything: true, cacheTtl: 604800 },
       }).catch(() => null);
 
-      // =======================================================================
-      // LAPIS 2: Jika gagal (misal ExHentai butuh Cookie / blokir Referer / Port H@H),
-      // lewatkan melalui Jembatan Anti-Loopback (i0.wp.com -> /raw Worker -> wsrv.nl)
-      // =======================================================================
+      // Rute 2: Jika ditolak karena Referer/Cookie/Port, suapkan ke wsrv.nl melalui /raw/image.jpg
       if (!wsrvRes || !wsrvRes.ok) {
-        const rawBridgeUrl = `${reqUrl.origin}/raw?sign=${INTERNAL_RAW_SIGN}${
+        const rawBridgeUrl = `${reqUrl.origin}/raw/image.jpg?sign=${INTERNAL_RAW_SIGN}${
           encodedCookie ? `&ck=${encodeURIComponent(encodedCookie)}` : ""
         }&url=${encodeURIComponent(rawUrl)}`;
 
-        // Coba panggil wsrv.nl langsung ke /raw terlebih dahulu
+        // 2A: wsrv.nl -> /raw/image.jpg
         wsrvRes = await fetch(buildWsrvUrl(rawBridgeUrl), {
           headers: { "User-Agent": "Mozilla/5.0" },
           signal: AbortSignal.timeout(6500),
           cf: { cacheEverything: true, cacheTtl: 604800 },
         }).catch(() => null);
 
-        // KUNCI ANTI-LOOPBACK: Jika Cloudflare memblokir wsrv.nl saat mengakses *.workers.dev/raw,
-        // gunakan CDN WordPress Photon (i0.wp.com) sebagai perantara antara wsrv.nl dan /raw!
-        // Alurnya: wsrv.nl (Kompres & Hitam Putih) -> i0.wp.com (Non-CF Relay) -> /raw Worker (Cookie & Referer ExHentai)
+        // 2B: Jika terkena blokir Loopback Cloudflare (*.workers.dev),
+        // lewatkan URL /raw/image.jpg melalui perantara Non-Cloudflare (i0.wp.com) lalu masukkan ke wsrv.nl!
         if (!wsrvRes || !wsrvRes.ok) {
           const parsedBridge = new URL(rawBridgeUrl);
           const wpRelayUrl = `https://i0.wp.com/${parsedBridge.host}${parsedBridge.pathname}${parsedBridge.search}`;
@@ -252,12 +260,9 @@ export default {
         }
       }
 
-      // =======================================================================
-      // LAPIS 3: Jika gambar asli berada di domain standar tapi wsrv.nl gagal,
-      // gunakan WordPress Photon (i0.wp.com) sebagai izvor bagi wsrv.nl
-      // =======================================================================
-      if ((!wsrvRes || !wsrvRes.ok) && !isSpecialEH) {
-        const parsed = new URL(rawUrl);
+      // Rute 3: Gunakan i0.wp.com sebagai pengambil sumber asli, lalu tetap suapkan hasilnya ke wsrv.nl!
+      if (!wsrvRes || !wsrvRes.ok) {
+        const parsed = new URL(cleanUrlForWsrv);
         const wpSource = `https://i0.wp.com/${parsed.host}${parsed.pathname}${parsed.search}`;
         wsrvRes = await fetch(buildWsrvUrl(wpSource), {
           headers: { "User-Agent": "Mozilla/5.0" },
@@ -266,9 +271,6 @@ export default {
         }).catch(() => null);
       }
 
-      // =======================================================================
-      // LAPIS 4: Final Fallback (Jika node H@H ExHentai mengunci IP ketat ke HP Anda)
-      // =======================================================================
       if (!wsrvRes || !wsrvRes.ok) {
         return Response.redirect(rawUrl, 302);
       }
